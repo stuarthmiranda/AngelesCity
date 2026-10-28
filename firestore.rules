@@ -1,0 +1,267 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function ownProfilePath() {
+      return /databases/$(database)/documents/profiles/$(request.auth.uid);
+    }
+
+    function hasProfile() {
+      return signedIn() && exists(ownProfilePath());
+    }
+
+    function validUsername(username) {
+      return username is string
+        && username.matches('^[a-z0-9._-]{3,20}$')
+        && username != 'admin';
+    }
+
+    function usernameIndexPath(username) {
+      return /databases/$(database)/documents/profiles/$('username_' + username);
+    }
+
+    function isUsernameIndex(profileId) {
+      return profileId.matches('^username_[a-z0-9._-]{3,20}$');
+    }
+
+    function isValidUsernameIndexCreate(profileId) {
+      return signedIn()
+        && (isVerifiedIdentity() || isAdminAlias())
+        && isUsernameIndex(profileId)
+        && request.resource.data.keys().hasOnly(['type', 'username', 'email', 'profile_id'])
+        && request.resource.data.type == 'username_index'
+        && validUsername(request.resource.data.username)
+        && profileId == 'username_' + request.resource.data.username
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.profile_id == request.auth.uid
+        && (!exists(/databases/$(database)/documents/usernames/$(request.resource.data.username))
+          || get(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.email
+            == request.auth.token.email)
+        && existsAfter(ownProfilePath())
+        && getAfter(ownProfilePath()).data.username == request.resource.data.username;
+    }
+
+    function isVerifiedIdentity() {
+      return signedIn()
+        && ((request.auth.token.keys().hasAny(['email_verified'])
+            && request.auth.token.email_verified == true)
+          || (request.auth.token.keys().hasAny(['firebase'])
+            && request.auth.token.firebase.sign_in_provider == 'google.com'));
+    }
+
+    function isAdminAlias() {
+      return signedIn()
+        && request.auth.token.keys().hasAny(['email'])
+        && request.auth.token.email == 'admin@angelescity-aa690.firebaseapp.com'
+        && hasProfile()
+        && get(ownProfilePath()).data.role == 'admin'
+        && get(ownProfilePath()).data.is_authorized == true;
+    }
+
+    function isAuthorized() {
+      return hasProfile()
+        && (isVerifiedIdentity() || isAdminAlias())
+        && get(ownProfilePath()).data.is_authorized == true;
+    }
+
+    function isAdmin() {
+      return isAuthorized() && get(ownProfilePath()).data.role == 'admin';
+    }
+
+    function isValidProfileCreate(uid) {
+      return signedIn()
+        && request.auth.uid == uid
+        && isVerifiedIdentity()
+        && request.resource.data.keys().hasOnly([
+          'display_name', 'username', 'role', 'is_authorized', 'created_at', 'requested_player_name'
+        ])
+        && request.resource.data.role == 'member'
+        && request.resource.data.is_authorized == true
+        && request.resource.data.display_name is string
+        && validUsername(request.resource.data.username)
+        && existsAfter(usernameIndexPath(request.resource.data.username))
+        && getAfter(usernameIndexPath(request.resource.data.username)).data.profile_id == uid
+        && getAfter(usernameIndexPath(request.resource.data.username)).data.email == request.auth.token.email
+        && request.resource.data.requested_player_name is string
+        && request.resource.data.requested_player_name.size() > 0
+        && request.resource.data.created_at is string;
+    }
+
+    function isValidMatchVote(matchId, playerId) {
+      let matchPath = /databases/$(database)/documents/matches/$(matchId);
+      let playerPath = /databases/$(database)/documents/players/$(playerId);
+      let rosterPath = /databases/$(database)/documents/matches/$(matchId)/players/$(playerId);
+      return isAuthorized()
+        && exists(matchPath)
+        && get(matchPath).data.status == 'open'
+        && get(matchPath).data.player_ids is list
+        && playerId in get(matchPath).data.player_ids
+        && exists(playerPath)
+        && get(playerPath).data.active == true
+        && get(playerPath).data.profile_id != request.auth.uid
+        && exists(rosterPath);
+    }
+
+    match /profiles/{uid} {
+      allow get: if (signedIn() && (request.auth.uid == uid || isAdmin()))
+        || isUsernameIndex(uid);
+      allow list: if isAdmin();
+      allow create: if isValidProfileCreate(uid) || isValidUsernameIndexCreate(uid);
+      allow update: if (isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'display_name', 'username', 'role', 'is_authorized', 'created_at', 'requested_player_name'
+        ])
+        && request.resource.data.role in ['member', 'admin']
+        && request.resource.data.is_authorized is bool
+        && request.resource.data.display_name is string
+        && (!('username' in request.resource.data.keys())
+          || validUsername(request.resource.data.username))
+        && (!('requested_player_name' in request.resource.data.keys())
+          || (request.resource.data.requested_player_name is string
+            && request.resource.data.requested_player_name.size() > 0))
+        && request.resource.data.created_at is string)
+        || (signedIn()
+          && request.auth.uid == uid
+          && (isVerifiedIdentity() || isAdminAlias())
+          && !('username' in resource.data.keys())
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['username'])
+          && validUsername(request.resource.data.username)
+          && existsAfter(usernameIndexPath(request.resource.data.username))
+          && getAfter(usernameIndexPath(request.resource.data.username)).data.profile_id == uid
+          && getAfter(usernameIndexPath(request.resource.data.username)).data.email
+            == request.auth.token.email);
+      allow delete: if false;
+    }
+
+    // Legacy lookups are read-only during migration; new username indexes live in profiles.
+    match /usernames/{username} {
+      allow get: if true;
+      allow list: if false;
+      allow create, update, delete: if false;
+    }
+
+    match /players/{playerId} {
+      allow read: if isAuthorized();
+      allow create: if (isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'name', 'profile_id', 'active', 'created_at', 'updated_at'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.active is bool
+        && (request.resource.data.profile_id == null
+          || exists(/databases/$(database)/documents/profiles/$(request.resource.data.profile_id))))
+        || (signedIn()
+          && request.auth.uid == playerId
+          && request.resource.data.keys().hasOnly([
+            'name', 'profile_id', 'active', 'created_at', 'updated_at'
+          ])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.profile_id == request.auth.uid
+          && request.resource.data.active == true
+          && !exists(ownProfilePath())
+          && existsAfter(ownProfilePath())
+          && getAfter(ownProfilePath()).data.requested_player_name == request.resource.data.name
+          && request.resource.data.created_at is string
+          && request.resource.data.updated_at is string);
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'profile_id', 'active', 'updated_at'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.active is bool
+        && (request.resource.data.profile_id == null
+          || exists(/databases/$(database)/documents/profiles/$(request.resource.data.profile_id)));
+      allow delete: if false;
+    }
+
+    match /profile_photos/{uid} {
+      allow get: if isAuthorized();
+      allow list: if false;
+      allow create, update: if isAuthorized()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['photo_data', 'updated_at'])
+        && request.resource.data.photo_data is string
+        && request.resource.data.photo_data.size() <= 850000
+        && request.resource.data.photo_data.matches('^data:image/jpeg;base64,[A-Za-z0-9+/]+={0,2}$')
+        && request.resource.data.updated_at is string
+        && request.resource.data.updated_at.size() <= 40;
+      allow delete: if isAuthorized() && request.auth.uid == uid;
+    }
+
+    match /matches/{matchId} {
+      allow read: if isAuthorized();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'played_at', 'opponent', 'status', 'player_ids', 'created_by',
+          'created_at', 'opened_at', 'closed_at'
+        ])
+        && request.resource.data.status == 'draft'
+        && request.resource.data.created_by == request.auth.uid
+        && request.resource.data.player_ids is list
+        && request.resource.data.player_ids.size() >= 2
+        && request.resource.data.played_at is string;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'status', 'opened_at', 'closed_at'
+        ])
+        && (
+          (resource.data.status == 'draft'
+            && request.resource.data.status == 'open'
+            && request.resource.data.player_ids.size() >= 2)
+          || (resource.data.status == 'open'
+            && request.resource.data.status == 'closed')
+        );
+      allow delete: if false;
+
+      match /players/{playerId} {
+        allow read: if isAuthorized();
+        allow create: if isAdmin()
+          && getAfter(/databases/$(database)/documents/matches/$(matchId)).data.status == 'draft'
+          && playerId in getAfter(/databases/$(database)/documents/matches/$(matchId)).data.player_ids
+          && exists(/databases/$(database)/documents/players/$(playerId))
+          && get(/databases/$(database)/documents/players/$(playerId)).data.active == true
+          && get(/databases/$(database)/documents/players/$(playerId)).data.profile_id != null;
+        allow update, delete: if false;
+      }
+
+      match /votes/{voterId} {
+        allow get: if isAdmin()
+          || (isAuthorized()
+            && (voterId == request.auth.uid
+              || get(/databases/$(database)/documents/matches/$(matchId)).data.status == 'closed'));
+        allow list: if isAdmin()
+          || (isAuthorized()
+            && get(/databases/$(database)/documents/matches/$(matchId)).data.status == 'closed');
+        allow create: if voterId == request.auth.uid
+          && request.resource.data.keys().hasOnly([
+            'match_id', 'voter_id', 'player_id', 'created_at', 'created_at_server'
+          ])
+          && request.resource.data.match_id == matchId
+          && request.resource.data.voter_id == request.auth.uid
+          && request.resource.data.player_id is string
+          && isValidMatchVote(matchId, request.resource.data.player_id);
+        allow update, delete: if false;
+      }
+    }
+
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        || (isAuthorized()
+          && request.resource.data.actor_id == request.auth.uid
+          && request.resource.data.action == 'vote.submitted'
+          && request.resource.data.entity_type == 'match'
+          && request.resource.data.entity_id is string
+          && request.resource.data.details.player_id is string
+          && existsAfter(/databases/$(database)/documents/matches/$(request.resource.data.entity_id)/votes/$(request.auth.uid))
+          && getAfter(/databases/$(database)/documents/matches/$(request.resource.data.entity_id)/votes/$(request.auth.uid)).data.player_id
+            == request.resource.data.details.player_id);
+      allow update, delete: if false;
+    }
+  }
+}
+  
